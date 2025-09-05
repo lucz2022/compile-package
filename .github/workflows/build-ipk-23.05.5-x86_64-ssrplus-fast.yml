@@ -6,18 +6,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Init environment
+      - name: Init environment (Ubuntu 24.04 friendly)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          set -eux
           sudo -E apt-get -qq update
-          sudo -E apt-get -qq install build-essential clang flex g++ gawk gcc-multilib gettext \
-            libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig \
-            libpython3-dev aria2 jq wget curl file bc cmake ninja-build
+          sudo -E apt-get -qq install \
+            build-essential clang flex g++ gawk gcc-multilib gettext \
+            libncurses5-dev libssl-dev rsync unzip zlib1g-dev swig \
+            libpython3-dev aria2 jq wget curl file bc cmake ninja-build \
+            python3 python3-setuptools
           sudo timedatectl set-timezone Asia/Shanghai
 
       - name: Download OpenWrt 23.05.5 x86_64 SDK
@@ -44,27 +48,25 @@ jobs:
           EOF
 
           ./scripts/feeds update -a
-          # 安装全部索引（不会编译），确保依赖能被解析
           ./scripts/feeds install -a
-          # 明确安装 ssr-plus 到包索引
           ./scripts/feeds install -p small luci-app-ssr-plus
 
-      - name: HOTFIX – 彻底关闭 lucihttp 的 Lua/ucode 绑定
+      - name: HOTFIX – 关闭 lucihttp 的 Lua/ucode 绑定（避免 lua.h 报错）
         working-directory: ${{ env.SDK_DIR }}
         run: |
           set -eux
-          # lucihttp 的 Makefile 在 luci/contrib/package/lucihttp 下
           MF="feeds/luci/contrib/package/lucihttp/Makefile"
           test -f "$MF"
-          # 强制把 cmake 里的 BUILD_LUA/BUILD_UCODE 关掉（避免找 lua.h）
-          sed -i 's/BUILD_LUA=ON/BUILD_LUA=OFF/g; s/BUILD_UCODE=ON/BUILD_UCODE=OFF/g' "$MF"
+          # 删除原有的 BUILD_LUA/BUILD_UCODE 行，重新追加为 OFF（更稳，不受顺序影响）
+          sed -i '/BUILD_LUA=/d;/BUILD_UCODE=/d' "$MF"
+          printf '\nCMAKE_OPTIONS += -DBUILD_LUA=OFF\nCMAKE_OPTIONS += -DBUILD_UCODE=OFF\n' >> "$MF"
 
       - name: Build luci-app-ssr-plus (IPK only)
         working-directory: ${{ env.SDK_DIR }}
         run: |
           set -eux
           make defconfig
-          # 单包编译，方便快速出 IPK，且日志清晰
+          # 单包编译，日志清晰，速度快（仅出 IPK，不做固件）
           make -j1 V=s package/feeds/small/luci-app-ssr-plus/compile
 
       - name: Collect artifacts
@@ -72,13 +74,11 @@ jobs:
         run: |
           set -eux
           mkdir -p _out
-          # small/luci 等 feed 产物目录
           find bin/packages -type f -name '*.ipk' -print -exec cp -f {} _out/ \;
-          # 也把 .config 留作参考
           cp -f .config _out/config-23.05.5-x86_64.txt || true
 
       - name: Upload IPKs
         uses: actions/upload-artifact@v4
         with:
           name: ipk-ssrplus-23.05.5-x86_64
-          path: ${{ env.SDK_DIR }}_out
+          path: ${{ env.SDK_DIR }}/_out
