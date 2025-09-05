@@ -39,7 +39,7 @@ jobs:
         run: |
           set -e
           cd "$SDK_DIR"
-          # 固定到 23.05 分支，并加入 kenzok8/small
+          # 固定到 23.05 分支，并加入 kenzok8/small（只挂需要的 feed，减少体积）
           cat > feeds.conf.default <<'EOF'
           src-git packages  https://git.openwrt.org/feed/packages.git;openwrt-23.05
           src-git luci      https://git.openwrt.org/project/luci.git;openwrt-23.05
@@ -72,19 +72,20 @@ jobs:
           CONFIG_PACKAGE_luci-base=y
           CONFIG_PACKAGE_luci-compat=y
 
-          # Lua/LuCI 运行时（SSR+ 控制台是 Lua 写的，23.05 用这套最稳）
+          # Lua/LuCI 运行时（SSR+ 控制台是 Lua 写的；让 lucihttp 能找到 lua.h）
           CONFIG_PACKAGE_lua=y
           CONFIG_PACKAGE_liblua=y
           CONFIG_PACKAGE_luci-lua-runtime=y
           CONFIG_PACKAGE_libubus-lua=y
           CONFIG_PACKAGE_libuci-lua=y
+          # lucihttp 的 Lua 绑定（由 LuCI 生态管理，显示选上更稳）
           CONFIG_PACKAGE_liblucihttp-lua=y
 
           # SSR-Plus（来自 kenzok8/small）
           CONFIG_PACKAGE_luci-app-ssr-plus=y
           CONFIG_PACKAGE_luci-i18n-ssr-plus-zh-cn=y
 
-          # 仅 SSR（最快）：用户态
+          # 仅 SSR（最快）：用户态（libev）
           CONFIG_PACKAGE_shadowsocksr-libev-ssr-local=y
           CONFIG_PACKAGE_shadowsocksr-libev-ssr-redir=y
 
@@ -97,10 +98,16 @@ jobs:
           EOF
           make defconfig
 
-      - name: Build IPKs (strict & fast)
+      - name: Build IPKs (prebuild lua -> lucihttp -> ssr-plus)
         run: |
           set -e
           cd "$SDK_DIR"
+
+          # 关键修复①：先把 Lua(目标端)编出来，提供 lua.h 等头文件到 staging_dir
+          make package/lua/compile -j"$(nproc)" V=s
+
+          # 关键修复②：先单独把 lucihttp 编出来（会用到上一步的 lua 头文件）
+          make package/feeds/luci/lucihttp/compile -j"$(nproc)" V=s
 
           # 先编 SSR+（严格：失败就停，并打印尾 300 行）
           set +e
