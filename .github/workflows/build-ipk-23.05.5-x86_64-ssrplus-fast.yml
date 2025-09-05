@@ -1,147 +1,84 @@
-name: Build IPKs Stable (23.05.5 x86_64 | SSR-Plus)
+name: Build-SSRPlus-23.05.5-x86_64
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-ipk:
-    runs-on: ubuntu-22.04
-    concurrency:
-      group: ipk-23.05.5-x86_64
-      cancel-in-progress: true
-
+  build:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
 
-      - name: Install host deps (cmake/ninja/meson/pkg-config included)
+      - name: Init environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib gettext git \
-            libncurses5-dev libssl-dev python3 python3-pip unzip zlib1g-dev file wget rsync \
-            libelf-dev ccache tar xz-utils jq cmake ninja-build meson pkg-config
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install build-essential clang flex g++ gawk gcc-multilib gettext \
+            libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig \
+            libpython3-dev aria2 jq wget curl file bc cmake ninja-build
+          sudo timedatectl set-timezone Asia/Shanghai
 
-      - name: Download OpenWrt SDK (23.05.5 / x86_64)
+      - name: Download OpenWrt 23.05.5 x86_64 SDK
         run: |
-          set -e
-          BASE_URL="https://downloads.openwrt.org/releases/23.05.5/targets/x86/64"
-          SDK_TAR="openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          (curl -fL "${BASE_URL}/${SDK_TAR}" -o "${SDK_TAR}") || \
-          (curl -fL "https://downloads.cdn.openwrt.org/releases/23.05.5/targets/x86/64/${SDK_TAR}" -o "${SDK_TAR}")
-          tar -xJf "${SDK_TAR}"
-          echo "SDK_DIR=$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)" >> $GITHUB_ENV
+          set -eux
+          URL="https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+          ALT="https://downloads.cdn.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+          curl -fL --retry 3 -o sdk.tar.xz "$URL" || curl -fL --retry 3 -o sdk.tar.xz "$ALT"
+          tar -xJf sdk.tar.xz
+          rm -f sdk.tar.xz
+          SDK_DIR="$(ls -d openwrt-sdk-23.05.5-*/ | head -n1)"
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
 
-      - name: (Optional) Cache dl/
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SDK_DIR }}/dl
-          key: sdk-23.05.5-x86_64-dl-${{ hashFiles('.github/workflows/build-ipk-23.05.5-x86_64-ssrplus-stable.yml') }}
-
-      - name: Prepare feeds (23.05 + small) & indexes
+      - name: Prepare feeds (pin 23.05) + add kenzok8/small
+        working-directory: ${{ env.SDK_DIR }}
         run: |
-          set -e
-          cd "$SDK_DIR"
-          # 只挂必须的 feed
+          set -eux
           cat > feeds.conf.default <<'EOF'
-          src-git packages  https://git.openwrt.org/feed/packages.git;openwrt-23.05
-          src-git luci      https://git.openwrt.org/project/luci.git;openwrt-23.05
-          src-git small     https://github.com/kenzok8/small-package.git;main
+          src-git packages https://git.openwrt.org/feed/packages.git;openwrt-23.05
+          src-git luci https://github.com/openwrt/luci.git;openwrt-23.05
+          src-git routing https://git.openwrt.org/feed/routing.git;openwrt-23.05
+          src-git telephony https://git.openwrt.org/feed/telephony.git;openwrt-23.05
+          src-git small https://github.com/kenzok8/small.git
           EOF
 
           ./scripts/feeds update -a
-          ./scripts/feeds install -a -p packages
-          ./scripts/feeds install -a -p luci
-
-          # 最小冲突清理（可按需扩展）
-          rm -rf feeds/small/dnsmasq feeds/small/lua feeds/small/libnftnl feeds/small/nftables feeds/small/libmnl || true
-
-          # 明确把 lucihttp 放进 build tree（方便我们先编/打补丁）
-          ./scripts/feeds install -p luci lucihttp
-
-          # 只装需要编的包（来自 small）
+          # 安装全部索引（不会编译），确保依赖能被解析
+          ./scripts/feeds install -a
+          # 明确安装 ssr-plus 到包索引
           ./scripts/feeds install -p small luci-app-ssr-plus
-          ./scripts/feeds install -p small shadowsocksr-libev-ssr-local shadowsocksr-libev-ssr-redir
-          ./scripts/feeds install -p small luci-i18n-ssr-plus-zh-cn || true
 
-          # 主机端工具（更稳）
-          make package/po2lmo/host/compile V=s || true
-
-      - name: Patch lucihttp to turn OFF Lua/Ucode bindings
+      - name: HOTFIX – 彻底关闭 lucihttp 的 Lua/ucode 绑定
+        working-directory: ${{ env.SDK_DIR }}
         run: |
-          set -e
-          cd "$SDK_DIR"
-          PKG_MK="feeds/luci/contrib/package/lucihttp/Makefile"
-          # lucihttp 的包里末尾硬编码了 -DBUILD_LUA=ON/-DBUILD_UCODE=ON，强制改为 OFF
-          sed -i 's/-DBUILD_LUA=ON/-DBUILD_LUA=OFF/g' "$PKG_MK" || true
-          sed -i 's/-DBUILD_UCODE=ON/-DBUILD_UCODE=OFF/g' "$PKG_MK" || true
-          echo "----- lucihttp Makefile CMAKE_OPTIONS after patch -----"
-          grep -n 'CMAKE_OPTIONS' "$PKG_MK" || true
+          set -eux
+          # lucihttp 的 Makefile 在 luci/contrib/package/lucihttp 下
+          MF="feeds/luci/contrib/package/lucihttp/Makefile"
+          test -f "$MF"
+          # 强制把 cmake 里的 BUILD_LUA/BUILD_UCODE 关掉（避免找 lua.h）
+          sed -i 's/BUILD_LUA=ON/BUILD_LUA=OFF/g; s/BUILD_UCODE=ON/BUILD_UCODE=OFF/g' "$MF"
 
-      - name: Minimal .config (SSR only; disable liblucihttp-lua)
+      - name: Build luci-app-ssr-plus (IPK only)
+        working-directory: ${{ env.SDK_DIR }}
         run: |
-          set -e
-          cd "$SDK_DIR"
-          cat > .config <<'EOF'
-          # LuCI 基础（精简）
-          CONFIG_PACKAGE_luci-base=y
-          CONFIG_PACKAGE_luci-compat=y
-
-          # Lua/LuCI 运行时（供 LuCI/SSR+ 脚本使用；不强制编 lucihttp 的 Lua 绑定）
-          CONFIG_PACKAGE_lua=y
-          CONFIG_PACKAGE_liblua=y
-          CONFIG_PACKAGE_luci-lua-runtime=y
-          CONFIG_PACKAGE_libubus-lua=y
-          CONFIG_PACKAGE_libuci-lua=y
-
-          # 关键：显式关闭 lucihttp 的 Lua 绑定包（只留 C 库）
-          # CONFIG_PACKAGE_liblucihttp-lua is not set
-
-          # SSR-Plus（small）
-          CONFIG_PACKAGE_luci-app-ssr-plus=y
-          CONFIG_PACKAGE_luci-i18n-ssr-plus-zh-cn=y
-
-          # SSR 用户态（快速）
-          CONFIG_PACKAGE_shadowsocksr-libev-ssr-local=y
-          CONFIG_PACKAGE_shadowsocksr-libev-ssr-redir=y
-          EOF
+          set -eux
           make defconfig
+          # 单包编译，方便快速出 IPK，且日志清晰
+          make -j1 V=s package/feeds/small/luci-app-ssr-plus/compile
 
-      - name: Build lucihttp first (force clean, single job, verbose)
+      - name: Collect artifacts
+        working-directory: ${{ env.SDK_DIR }}
         run: |
-          set -e
-          cd "$SDK_DIR"
-          # 清理以防 CMakeCache 残留 ON 配置
-          make package/feeds/luci/lucihttp/clean V=s || true
-          rm -f build_dir/target-*/lucihttp-*/CMakeCache.txt || true
-          make package/feeds/luci/lucihttp/compile -j1 V=s
-
-      - name: Build SSR-Plus & SSR backend
-        run: |
-          set -e
-          cd "$SDK_DIR"
-
-          set +e
-          make package/luci-app-ssr-plus/compile -j"$(nproc)" 2>&1 | tee build_ssrplus.log
-          RC=${PIPESTATUS[0]}
-          if [ $RC -ne 0 ]; then
-            echo "==== Tail of build_ssrplus.log ===="; tail -n 300 build_ssrplus.log
-            exit $RC
-          fi
-          set -e
-
-          make package/shadowsocksr-libev/compile -j"$(nproc)" V=s
-
-          mkdir -p ipk_out
-          find bin/ -type f -name '*.ipk' -exec cp -av {} ipk_out/ \;
-          if ! ls ipk_out/luci-app-ssr-plus_*.ipk >/dev/null 2>&1; then
-            echo "FATAL: luci-app-ssr-plus ipk not found."; exit 2
-          fi
-          ls -lh ipk_out
+          set -eux
+          mkdir -p _out
+          # small/luci 等 feed 产物目录
+          find bin/packages -type f -name '*.ipk' -print -exec cp -f {} _out/ \;
+          # 也把 .config 留作参考
+          cp -f .config _out/config-23.05.5-x86_64.txt || true
 
       - name: Upload IPKs
         uses: actions/upload-artifact@v4
         with:
-          name: ipk-23.05.5-x86_64-ssrplus-stable
-          path: ${{ env.SDK_DIR }}/ipk_out/*.ipk
+          name: ipk-ssrplus-23.05.5-x86_64
+          path: ${{ env.SDK_DIR }}_out
