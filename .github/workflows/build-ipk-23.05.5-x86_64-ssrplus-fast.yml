@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Install host deps (add cmake/ninja/meson/pkg-config)
+      - name: Install host deps (cmake/ninja/meson/pkg-config included)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -43,6 +43,7 @@ jobs:
         run: |
           set -e
           cd "$SDK_DIR"
+          # 只挂必须的 feed
           cat > feeds.conf.default <<'EOF'
           src-git packages  https://git.openwrt.org/feed/packages.git;openwrt-23.05
           src-git luci      https://git.openwrt.org/project/luci.git;openwrt-23.05
@@ -53,27 +54,30 @@ jobs:
           ./scripts/feeds install -a -p packages
           ./scripts/feeds install -a -p luci
 
-          # 剔除 small 里与官方同名的基础包（最小稳定集合）
+          # 最小冲突清理（可按需扩展）
           rm -rf feeds/small/dnsmasq feeds/small/lua feeds/small/libnftnl feeds/small/nftables feeds/small/libmnl || true
 
-          # 仅装我们要编的包（来自 small）
+          # 明确把 lucihttp 放进 build tree（方便我们先编/打补丁）
+          ./scripts/feeds install -p luci lucihttp
+
+          # 只装需要编的包（来自 small）
           ./scripts/feeds install -p small luci-app-ssr-plus
           ./scripts/feeds install -p small shadowsocksr-libev-ssr-local shadowsocksr-libev-ssr-redir
           ./scripts/feeds install -p small luci-i18n-ssr-plus-zh-cn || true
 
-          # 主机端工具（可选）
+          # 主机端工具（更稳）
           make package/po2lmo/host/compile V=s || true
 
-      - name: Patch lucihttp to disable Lua binding (BUILD_LUA=OFF)
+      - name: Patch lucihttp to turn OFF Lua/Ucode bindings
         run: |
           set -e
           cd "$SDK_DIR"
           PKG_MK="feeds/luci/contrib/package/lucihttp/Makefile"
-          # 在 include $(INCLUDE_DIR)/package.mk 之前插入 CMAKE_OPTIONS 行；若不存在则追加
-          sed -i '/^include \$(INCLUDE_DIR)\/package\.mk/i CMAKE_OPTIONS += -DBUILD_LUA=OFF' "$PKG_MK" || true
-          grep -q 'CMAKE_OPTIONS \+= -DBUILD_LUA=OFF' "$PKG_MK" || echo 'CMAKE_OPTIONS += -DBUILD_LUA=OFF' >> "$PKG_MK"
-          echo "----- lucihttp Makefile snippet -----"
-          nl -ba "$PKG_MK" | sed -n '1,120p'
+          # lucihttp 的包里末尾硬编码了 -DBUILD_LUA=ON/-DBUILD_UCODE=ON，强制改为 OFF
+          sed -i 's/-DBUILD_LUA=ON/-DBUILD_LUA=OFF/g' "$PKG_MK" || true
+          sed -i 's/-DBUILD_UCODE=ON/-DBUILD_UCODE=OFF/g' "$PKG_MK" || true
+          echo "----- lucihttp Makefile CMAKE_OPTIONS after patch -----"
+          grep -n 'CMAKE_OPTIONS' "$PKG_MK" || true
 
       - name: Minimal .config (SSR only; disable liblucihttp-lua)
         run: |
@@ -91,29 +95,33 @@ jobs:
           CONFIG_PACKAGE_libubus-lua=y
           CONFIG_PACKAGE_libuci-lua=y
 
-          # 关键：显式关闭 lucihttp 的 Lua 绑定包
+          # 关键：显式关闭 lucihttp 的 Lua 绑定包（只留 C 库）
           # CONFIG_PACKAGE_liblucihttp-lua is not set
 
           # SSR-Plus（small）
           CONFIG_PACKAGE_luci-app-ssr-plus=y
           CONFIG_PACKAGE_luci-i18n-ssr-plus-zh-cn=y
 
-          # SSR 用户态（最快）
+          # SSR 用户态（快速）
           CONFIG_PACKAGE_shadowsocksr-libev-ssr-local=y
           CONFIG_PACKAGE_shadowsocksr-libev-ssr-redir=y
           EOF
           make defconfig
 
-      - name: Build lucihttp first (single job, verbose)
+      - name: Build lucihttp first (force clean, single job, verbose)
         run: |
           set -e
           cd "$SDK_DIR"
+          # 清理以防 CMakeCache 残留 ON 配置
+          make package/feeds/luci/lucihttp/clean V=s || true
+          rm -f build_dir/target-*/lucihttp-*/CMakeCache.txt || true
           make package/feeds/luci/lucihttp/compile -j1 V=s
 
       - name: Build SSR-Plus & SSR backend
         run: |
           set -e
           cd "$SDK_DIR"
+
           set +e
           make package/luci-app-ssr-plus/compile -j"$(nproc)" 2>&1 | tee build_ssrplus.log
           RC=${PIPESTATUS[0]}
@@ -122,6 +130,7 @@ jobs:
             exit $RC
           fi
           set -e
+
           make package/shadowsocksr-libev/compile -j"$(nproc)" V=s
 
           mkdir -p ipk_out
