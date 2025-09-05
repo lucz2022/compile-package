@@ -1,84 +1,91 @@
-name: Build-SSRPlus-23.05.5-x86_64
+name: Build luci-app-ssr-plus IPK (OpenWrt 23.05.5 x86_64)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+
+    env:
+      SDK_URL: https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+      SDK_DIR: openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Init environment (Ubuntu 24.04 friendly)
-        env:
-          DEBIAN_FRONTEND: noninteractive
+      - name: Prepare host deps
         run: |
-          set -eux
           sudo -E apt-get -qq update
-          sudo -E apt-get -qq install \
-            build-essential clang flex g++ gawk gcc-multilib gettext \
-            libncurses5-dev libssl-dev rsync unzip zlib1g-dev swig \
-            libpython3-dev aria2 jq wget curl file bc cmake ninja-build \
-            python3 python3-setuptools
-          sudo timedatectl set-timezone Asia/Shanghai
+          sudo -E apt-get -y install --no-install-recommends \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses5-dev libssl-dev python3 python3-pip \
+            zlib1g-dev file rsync unzip upx-ucl zstd libelf-dev \
+            libtool cmake ninja-build curl ca-certificates wget
 
-      - name: Download OpenWrt 23.05.5 x86_64 SDK
+      - name: Download & Extract OpenWrt SDK (23.05.5 x86_64)
         run: |
-          set -eux
-          URL="https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          ALT="https://downloads.cdn.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          curl -fL --retry 3 -o sdk.tar.xz "$URL" || curl -fL --retry 3 -o sdk.tar.xz "$ALT"
-          tar -xJf sdk.tar.xz
-          rm -f sdk.tar.xz
-          SDK_DIR="$(ls -d openwrt-sdk-23.05.5-*/ | head -n1)"
-          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+          mkdir -p $GITHUB_WORKSPACE/sdk && cd $GITHUB_WORKSPACE/sdk
+          echo "::group::download"
+          wget -q "$SDK_URL"
+          echo "::endgroup::"
+          tar -xJf "$(basename "$SDK_URL")"
+          ln -s "$SDK_DIR" sdk
 
-      - name: Prepare feeds (pin 23.05) + add kenzok8/small
-        working-directory: ${{ env.SDK_DIR }}
+      - name: Prepare feeds (official 23.05 + kenzok8 small/small-package)
+        working-directory: sdk
         run: |
-          set -eux
+          # 覆盖 feeds.conf.default，固定到 23.05 分支，外加 kenzok8 两个源
           cat > feeds.conf.default <<'EOF'
-          src-git packages https://git.openwrt.org/feed/packages.git;openwrt-23.05
-          src-git luci https://github.com/openwrt/luci.git;openwrt-23.05
-          src-git routing https://git.openwrt.org/feed/routing.git;openwrt-23.05
-          src-git telephony https://git.openwrt.org/feed/telephony.git;openwrt-23.05
-          src-git small https://github.com/kenzok8/small.git
+          src-git packages https://github.com/openwrt/packages;openwrt-23.05
+          src-git luci https://github.com/openwrt/luci;openwrt-23.05
+          src-git routing https://github.com/openwrt-routing/packages;openwrt-23.05
+          src-git telephony https://github.com/openwrt/telephony;openwrt-23.05
+          src-git small https://github.com/kenzok8/small
+          src-git small8 https://github.com/kenzok8/small-package
           EOF
 
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          ./scripts/feeds install -p small luci-app-ssr-plus
+          # 只装我们需要的包，避免拉太多依赖
+          ./scripts/feeds install luci-base luci-compat luci-app-ssr-plus
 
-      - name: HOTFIX – 关闭 lucihttp 的 Lua/ucode 绑定（避免 lua.h 报错）
-        working-directory: ${{ env.SDK_DIR }}
+      - name: TURN OFF lucihttp Lua bindings (avoid lua.h missing)
+        working-directory: sdk
         run: |
-          set -eux
-          MF="feeds/luci/contrib/package/lucihttp/Makefile"
-          test -f "$MF"
-          # 删除原有的 BUILD_LUA/BUILD_UCODE 行，重新追加为 OFF（更稳，不受顺序影响）
-          sed -i '/BUILD_LUA=/d;/BUILD_UCODE=/d' "$MF"
-          printf '\nCMAKE_OPTIONS += -DBUILD_LUA=OFF\nCMAKE_OPTIONS += -DBUILD_UCODE=OFF\n' >> "$MF"
+          # 有些环境会顺带去编译 lucihttp，默认会尝试 Lua 绑定 -> 缺 lua.h 就炸。
+          # 这里把 package 的 CMake 选项强制关闭 BUILD_LUA（不存在也不会报错）。
+          PKG_MK="feeds/luci/contrib/package/lucihttp/Makefile"
+          if [ -f "$PKG_MK" ]; then
+            grep -q 'CMAKE_OPTIONS' "$PKG_MK" || echo 'CMAKE_OPTIONS :=' >> "$PKG_MK"
+            # 先清理可能的 ON，再强制 OFF
+            sed -i 's/BUILD_LUA=ON/BUILD_LUA=OFF/g' "$PKG_MK" || true
+            echo 'CMAKE_OPTIONS += -DBUILD_LUA=OFF -DBUILD_UCODE=ON' >> "$PKG_MK"
+          fi
 
-      - name: Build luci-app-ssr-plus (IPK only)
-        working-directory: ${{ env.SDK_DIR }}
+      - name: Defconfig
+        working-directory: sdk
         run: |
-          set -eux
+          # SDK 下目标已固定为 x86_64，这里生成默认 .config 即可
           make defconfig
-          # 单包编译，日志清晰，速度快（仅出 IPK，不做固件）
+
+      - name: Build luci-app-ssr-plus (single-thread, verbose)
+        working-directory: sdk
+        run: |
+          # 单线程 + V=s 避免 CI 随机性，更容易看日志
           make -j1 V=s package/feeds/small/luci-app-ssr-plus/compile
 
-      - name: Collect artifacts
-        working-directory: ${{ env.SDK_DIR }}
+      - name: Collect IPKs
+        working-directory: sdk
         run: |
-          set -eux
-          mkdir -p _out
-          find bin/packages -type f -name '*.ipk' -print -exec cp -f {} _out/ \;
-          cp -f .config _out/config-23.05.5-x86_64.txt || true
+          mkdir -p $GITHUB_WORKSPACE/output
+          # 收集刚编好的 IPK（包含依赖包）
+          find bin/ -type f -name "*.ipk" -exec cp -f {} $GITHUB_WORKSPACE/output/ \;
+          echo "Found IPKs:"
+          ls -l $GITHUB_WORKSPACE/output || true
 
-      - name: Upload IPKs
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipk-ssrplus-23.05.5-x86_64
-          path: ${{ env.SDK_DIR }}/_out
+          name: ssrplus-ipk-23.05-x86_64
+          path: output/*.ipk
